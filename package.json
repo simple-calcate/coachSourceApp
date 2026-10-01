@@ -1,0 +1,18 @@
+{
+  "name": "coach-source-app",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "个人训练数据采集与导出工具",
+  "scripts": {
+    "tauri": "tauri",
+    "desktop:dev": "tauri dev",
+    "desktop:build": "tauri build",
+    "android:init": "tauri android init",
+    "android:dev": "tauri android dev",
+    "android:build": "tauri android build --apk"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.5.0"
+  }
+}

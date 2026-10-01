@@ -1,0 +1,28 @@
+# Rust / Tauri 构建产物
+/src-tauri/target/
+node_modules/
+
+# 打包产物
+*.apk
+*.idsig
+
+# 签名密钥不上传（口令在 build-android.sh 里，仓库私有时也不该带密钥）
+coachsource.jks
+
+# Android / Gradle 本机构建产物与机器相关配置
+/src-tauri/gen/android/.gradle/
+/src-tauri/gen/android/build/
+/src-tauri/gen/android/app/build/
+/src-tauri/gen/android/local.properties
+/src-tauri/gen/android/.cxx/
+/src-tauri/gen/android/app/src/main/jniLibs/arm64-v8a/
+/src-tauri/gen/android/app/src/main/jniLibs/armeabi-v7a/
+/src-tauri/gen/android/app/src/main/jniLibs/x86/
+/src-tauri/gen/android/app/src/main/jniLibs/x86_64/
+
+# WorkBuddy 内部工作数据
+.workbuddy/
+
+# 系统杂项
+.DS_Store
+Thumbs.db

@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<title>CoachSource 数据采集</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="dot"></span>
+    <h1>CoachSource</h1>
+  </div>
+  <div class="stats" id="stats"></div>
+</header>
+
+<div id="banner" class="banner hidden"></div>
+
+<!-- ============ 录入 ============ -->
+<main id="view-compose" class="view">
+  <div class="card">
+    <div class="row">
+      <label class="field">
+        <span>来源</span>
+        <select id="f-source">
+          <option value="manual">手打 / 语音输入</option>
+          <option value="ai">AI 对话整理</option>
+          <option value="meeting">会议 / 聊天记录</option>
+          <option value="photo">拍照题目</option>
+          <option value="import">导入</option>
+        </select>
+      </label>
+      <label class="field grow">
+        <span>标签</span>
+        <input id="f-tags" type="text" placeholder="用逗号分隔，如：数学,偏好">
+      </label>
+    </div>
+    <label class="field">
+      <span>标题（可留空）</span>
+      <input id="f-title" type="text" placeholder="给这段对话起个名字，方便以后找">
+    </label>
+  </div>
+
+  <div id="turns" class="turns"></div>
+
+  <div id="tok-bar" class="card tok-bar hidden">
+    <div class="addrow">
+      <button id="btn-tok-view" class="ghost">观察分词</button>
+      <button id="btn-tok-full" class="ghost hidden">全开（逐 token 着色）</button>
+      <button id="btn-tok-addsel" class="ghost hidden">选中文字加入分词器</button>
+      <span class="hint" id="tok-ratio"></span>
+    </div>
+    <p class="hint" id="tok-hint">默认只给「没被词汇覆盖的字」着色；点一段着色的字可以直接把它加进词汇表。</p>
+  </div>
+
+  <div class="addrow">
+    <button class="ghost" data-add="user">+ 用户</button>
+    <button class="ghost" data-add="assistant">+ 助手</button>
+    <button class="ghost" data-add="system">+ 系统提示</button>
+  </div>
+
+  <div id="compose-chars" class="chars-line">本条 0 字</div>
+
+  <div class="actions">
+    <button id="btn-save" class="primary">保存</button>
+    <button id="btn-save-new" class="ghost">保存并新建</button>
+    <button id="btn-clear" class="ghost danger">清空</button>
+  </div>
+
+  <div class="card">
+    <button id="btn-toggle-paste" class="linkbtn">粘贴一整段 AI 对话，自动切成轮次</button>
+    <div id="paste-area" class="hidden">
+      <textarea id="paste-text" rows="7" placeholder="把整段对话粘进来。会识别 User:/Assistant:、### 用户、【我】这类分隔标记。"></textarea>
+      <div class="addrow">
+        <button id="btn-paste" class="primary">解析并填入</button>
+        <button id="btn-paste-cancel" class="ghost">取消</button>
+      </div>
+    </div>
+  </div>
+</main>
+
+<!-- ============ 库 ============ -->
+<main id="view-library" class="view hidden">
+  <div class="seg">
+    <button data-bucket="pending" class="active">待导出 <b id="cnt-pending">0</b></button>
+    <button data-bucket="exported">已导出 <b id="cnt-exported">0</b></button>
+    <button data-bucket="archived">回收站 <b id="cnt-archived">0</b></button>
+  </div>
+
+  <div class="card">
+    <input id="f-search" type="text" placeholder="搜索内容、标签、来源…">
+    <p class="hint" id="bucket-hint"></p>
+  </div>
+
+  <div id="trash-bar" class="trash-bar hidden">
+    <span>已选 <b id="sel-count">0</b> 条</span>
+    <button id="btn-restore" class="primary">恢复到待导出</button>
+    <button id="btn-sel-all" class="ghost">全选</button>
+    <button id="btn-del-sel" class="ghost danger">删除</button>
+    <button id="btn-sel-none" class="ghost">取消</button>
+  </div>
+
+  <div id="list" class="list"></div>
+  <div id="list-empty" class="empty hidden">还没有数据。切到「录入」开始记第一条。</div>
+</main>
+
+<!-- ============ 导出 ============ -->
+<main id="view-export" class="view">
+  <div class="card">
+    <h2>导出训练文件</h2>
+
+    <label class="field">
+      <span>格式</span>
+      <select id="e-format">
+        <option value="sft">SFT 对话格式（conversations）</option>
+        <option value="pretrain">预训练纯文本格式（text）</option>
+      </select>
+    </label>
+
+    <label class="field">
+      <span>范围</span>
+      <select id="e-scope">
+        <option value="pending">只导出新增的（推荐）</option>
+        <option value="all">全部重新导出</option>
+      </select>
+    </label>
+
+    <label class="check">
+      <input id="e-meta" type="checkbox">
+      <span>附带元数据（id / 标签 / 来源）。<em>想直接喂训练脚本就别勾</em></span>
+    </label>
+
+    <div class="addrow">
+      <button id="btn-export" class="primary">导出</button>
+      <button id="btn-export-to" class="ghost">导出到指定目录…</button>
+    </div>
+
+    <div class="addrow">
+      <button id="btn-mirror" class="ghost">镜像成固定文件</button>
+      <button id="btn-open-dir" class="ghost">打开数据目录</button>
+    </div>
+    <p class="hint" id="e-result"></p>
+  </div>
+
+  <div class="card">
+    <h2>导入 / 合并</h2>
+    <p class="hint">手机和电脑各自导出后，在这边导入即可自动去重合并。</p>
+    <div class="addrow">
+      <button id="btn-import-file" class="ghost">选择文件（jsonl / zip）</button>
+      <button id="btn-toggle-text" class="ghost">粘贴文本导入</button>
+    </div>
+    <div id="import-area" class="hidden">
+      <textarea id="import-text" rows="6" placeholder="粘贴 jsonl 内容，每行一条"></textarea>
+      <div class="addrow">
+        <button id="btn-import-text" class="primary">导入</button>
+      </div>
+    </div>
+    <p class="hint" id="i-result"></p>
+  </div>
+
+  <div class="card">
+    <h2>数据位置</h2>
+    <p class="hint mono" id="cfg-path">—</p>
+    <div class="addrow">
+      <button id="btn-backup" class="ghost">备份全部（含图片）</button>
+      <button id="btn-reset-exported" class="ghost danger">清除已导出标记</button>
+    </div>
+    <p class="hint">
+      数据直接写在上面的目录里，是你自己的文件：可以复制、备份、用任何工具打开。
+      浏览器缓存被清空也不会影响它。
+    </p>
+  </div>
+</main>
+
+<!-- ============ 云端同步 ============ -->
+<main id="view-sync" class="view hidden">
+  <div class="card">
+    <h2>GitHub 账号</h2>
+    <div id="gh-logged-out">
+      <label class="field">
+        <span>OAuth App 的 Client ID</span>
+        <input id="gh-client-id" type="text" placeholder="Iv1.xxxxxxxxxxxxxxxx" autocomplete="off">
+      </label>
+      <p class="hint">
+        没有的话去 GitHub → Settings → Developer settings → OAuth Apps → New OAuth App，
+        勾上 <b>Enable device flow</b>，然后把 Client ID 粘过来（<em>不需要密钥</em>）。
+        Callback URL 随便填，比如 http://localhost。
+      </p>
+      <div class="addrow">
+        <button id="btn-gh-login" class="primary">用 GitHub 登录</button>
+      </div>
+    </div>
+
+    <div id="gh-device" class="hidden">
+      <p class="hint">打开下面这个网址，输入这串码：</p>
+      <div class="device-code" id="gh-user-code">----</div>
+      <p class="hint mono" id="gh-verify-uri">—</p>
+      <div class="addrow">
+        <button id="btn-gh-open" class="primary">打开授权页</button>
+        <button id="btn-gh-cancel" class="ghost">取消</button>
+      </div>
+      <p class="hint" id="gh-waiting">等待你在网页上确认…</p>
+    </div>
+
+    <div id="gh-logged-in" class="hidden">
+      <p class="hint">已登录为 <b id="gh-login-name">—</b></p>
+      <div class="addrow">
+        <button id="btn-gh-logout" class="ghost danger">退出登录</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>目标仓库</h2>
+    <div class="row">
+      <label class="field grow">
+        <span>仓库名</span>
+        <input id="gh-repo" type="text" placeholder="coach-source-data">
+      </label>
+      <label class="field grow">
+        <span>分支</span>
+        <input id="gh-branch" type="text" placeholder="main">
+      </label>
+    </div>
+    <label class="field">
+      <span>归属者（可留空，默认用登录账号）</span>
+      <input id="gh-owner" type="text" placeholder="留空 = 你自己的账号">
+    </label>
+
+    <label class="check">
+      <input id="gh-private" type="checkbox" checked>
+      <span>私有仓库。取消勾选后全世界都能看到并下载，且无法保证彻底清除</span>
+    </label>
+
+    <div class="addrow">
+      <button id="btn-gh-test" class="ghost">检查仓库</button>
+      <button id="btn-gh-create" class="ghost">创建仓库</button>
+      <button id="btn-gh-apply-vis" class="ghost">应用可见性</button>
+    </div>
+    <p class="hint" id="gh-repo-result">—</p>
+  </div>
+
+  <div class="card">
+    <h2>同步</h2>
+    <p class="hint">
+      把「待导出 + 已导出」的全部对话拼成 jsonl，切成若干个严格小于 100MB 的文件，
+      连同图片包一起传到 <span class="mono">data/&lt;日期&gt;/</span>，
+      再逐个校验云端内容，最后才把它们移进回收站。
+    </p>
+
+    <div class="row">
+      <label class="field">
+        <span>单个分片上限（MB）</span>
+        <input id="gh-shard" type="number" min="1" max="95" value="50">
+      </label>
+      <label class="check grow">
+        <input id="gh-images" type="checkbox" checked>
+        <span>连图片一起传（单独打成 zip 分片）</span>
+      </label>
+    </div>
+
+    <p class="hint" id="gh-syncable">—</p>
+
+    <div class="addrow">
+      <button id="btn-gh-sync" class="primary">开始同步</button>
+    </div>
+
+    <div id="gh-progress" class="progress hidden">
+      <div class="bar"><div id="gh-bar" class="bar-fill"></div></div>
+      <p class="hint" id="gh-phase">—</p>
+    </div>
+
+    <div id="gh-report" class="hidden">
+      <h3>同步结果</h3>
+      <p class="hint" id="gh-report-sum"></p>
+      <div id="gh-files" class="filelist"></div>
+      <div class="addrow">
+        <button id="btn-gh-open-repo" class="ghost">在 GitHub 上打开</button>
+        <button id="btn-gh-copy-links" class="ghost">复制全部下载链接</button>
+      </div>
+      <p class="hint" id="gh-copy-result"></p>
+    </div>
+  </div>
+</main>
+
+<!-- ============ 设置 ============ -->
+<main id="view-settings" class="view hidden">
+  <div class="card">
+    <h2>分词器</h2>
+    <p class="hint">
+      用你自己维护的词汇表对对话做最大前缀匹配，观察文本会被怎么切分。
+      导出和云端同步时，词汇表会以字典树（tokenizer_trie.json）单独附带，
+      多份导出以后可以直接合并，用于将来的分词器训练。
+    </p>
+
+    <label class="check">
+      <input id="s-tok-enabled" type="checkbox">
+      <span>启用分词器（默认关闭）</span>
+    </label>
+
+    <div class="row">
+      <label class="field">
+        <span>分词器 · 未被覆盖字体颜色</span>
+        <div class="colorrow">
+          <input id="s-tok-color" type="color" value="#e06c75">
+          <input id="s-tok-color-hex" type="text" class="mono" maxlength="7" spellcheck="false">
+        </div>
+      </label>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>词汇表</h2>
+    <div class="addrow">
+      <input id="s-vocab-new" type="text" placeholder="输入一个词，回车或点添加" class="grow">
+      <button id="s-vocab-add" class="primary">添加</button>
+    </div>
+    <p class="hint" id="s-vocab-count">共 0 个词</p>
+    <div id="s-vocab-list" class="vocab-list"></div>
+    <div class="addrow">
+      <button id="s-vocab-import" class="ghost">导入字典树文件…</button>
+      <button id="s-vocab-export" class="ghost">导出字典树文件</button>
+    </div>
+    <p class="hint" id="s-vocab-result"></p>
+  </div>
+</main>
+
+<nav class="tabbar">
+  <button data-view="compose" class="active">录入</button>
+  <button data-view="library">库</button>
+  <button data-view="export">导出</button>
+  <button data-view="sync">同步</button>
+  <button data-view="settings">设置</button>
+</nav>
+
+<input id="file-image" type="file" accept="image/*" multiple hidden>
+<input id="file-camera" type="file" accept="image/*" capture="environment" hidden>
+<input id="file-import" type="file" accept=".jsonl,.json,.zip,.txt" hidden>
+<input id="file-trie" type="file" accept=".json" hidden>
+
+<script src="app.js"></script>
+</body>
+</html>

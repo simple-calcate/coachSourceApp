@@ -1,0 +1,26 @@
+# Android 15（API 35）起，系统强制要求原生库按 16KB 内存页对齐，
+# 否则 APK 在 Android 16 设备上会安装失败或启动即崩溃。
+# 这里给所有 Android 目标统一加上链接参数。桌面端不受影响。
+[target.aarch64-linux-android]
+rustflags = [
+  "-C", "link-arg=-Wl,-z,max-page-size=16384",
+  "-C", "link-arg=-Wl,-z,common-page-size=16384",
+]
+
+[target.armv7-linux-androideabi]
+rustflags = [
+  "-C", "link-arg=-Wl,-z,max-page-size=16384",
+  "-C", "link-arg=-Wl,-z,common-page-size=16384",
+]
+
+[target.i686-linux-android]
+rustflags = [
+  "-C", "link-arg=-Wl,-z,max-page-size=16384",
+  "-C", "link-arg=-Wl,-z,common-page-size=16384",
+]
+
+[target.x86_64-linux-android]
+rustflags = [
+  "-C", "link-arg=-Wl,-z,max-page-size=16384",
+  "-C", "link-arg=-Wl,-z,common-page-size=16384",
+]
