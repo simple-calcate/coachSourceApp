@@ -108,6 +108,37 @@ function readFileAsDataURL(file) {
   });
 }
 
+/** 图片入库前先压一遍：长边超过 2048 的缩到 2048，统一重编码为 JPEG（质量 0.85）。
+ *  手机随手一拍就是 3-8MB、4000+ 像素，原样存的话同步分片一个图片包就爆 100MB。
+ *  GIF 保留原样（canvas 转 JPEG 会丢动画）；加载失败也退回原图，宁可大也不能丢。 */
+async function compressImage(dataUrl) {
+  if (/^data:image\/gif/i.test(dataUrl)) return dataUrl;
+  try {
+    const img = await new Promise((ok, no) => {
+      const i = new Image();
+      i.onload = () => ok(i);
+      i.onerror = no;
+      i.src = dataUrl;
+    });
+    const MAX = 2048;
+    const scale = Math.min(1, MAX / Math.max(img.width, img.height));
+    const w = Math.max(1, Math.round(img.width * scale));
+    const h = Math.max(1, Math.round(img.height * scale));
+    const cv = document.createElement('canvas');
+    cv.width = w;
+    cv.height = h;
+    const ctx = cv.getContext('2d');
+    // JPEG 没有透明通道，先铺白底，免得透明区域变成黑色
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(img, 0, 0, w, h);
+    const out = cv.toDataURL('image/jpeg', 0.85);
+    return out.length < dataUrl.length ? out : dataUrl;
+  } catch (e) {
+    return dataUrl;
+  }
+}
+
 function readFileAsText(file) {
   return new Promise((res, rej) => {
     const r = new FileReader();
@@ -324,6 +355,11 @@ const B = {
   async remove(id) {
     if (IS_TAURI) return invoke('delete_record', { id });
     LocalBackend.save(LocalBackend.load().filter((r) => r.id !== id));
+  },
+  async removeMany(ids) {
+    if (!ids.length) return;
+    if (IS_TAURI) return invoke('delete_records', { ids });
+    LocalBackend.save(LocalBackend.load().filter((r) => !ids.includes(r.id)));
   },
   async saveImage(dataUrl) {
     const ext = (dataUrl.match(/data:image\/(\w+)/) || [, 'jpg'])[1];
@@ -638,7 +674,7 @@ const state = {
   listIds: [],
   gh: null, // GitHub 配置（令牌、仓库…）
   ghReport: null, // 最近一次同步的结果
-  tok: { view: false, full: false }, // 分词观察开关（view=逐轮观察，full=全开随机取色）
+  tok: { view: false, full: false, sel: null }, // 分词观察开关；sel = 逐字点击的选区 {turn, a, b}
 };
 
 function blankTurn(role) {
@@ -820,7 +856,7 @@ function pickImage(turn, index, mode) {
     const files = Array.from(input.files || []);
     for (const f of files) {
       try {
-        const du = await readFileAsDataURL(f);
+        const du = await compressImage(await readFileAsDataURL(f));
         const name = await B.saveImage(du);
         state.turns[index].images.push(name);
       } catch (e) {
@@ -1022,7 +1058,7 @@ function updateTrashBar() {
   $('#trash-bar').classList.toggle('hidden', !show);
   $('#sel-count').textContent = n;
   const btn = $('#btn-restore');
-  if (btn) btn.textContent = b === 'archived' ? '恢复到待导出' : '恢复到待导出';
+  if (btn) btn.textContent = '恢复到待导出';
   const del = $('#btn-del-sel');
   if (del) del.textContent = b === 'archived' ? '彻底删除' : '删除';
 }
@@ -1361,8 +1397,6 @@ async function copyLinks() {
   }
 }
 
-  /^\s*(#{1,6}\s*)?(assistant|ai|gpt|chatgpt|claude|助手|答|回答|模型)\s*[:：]|^\s*[【\[]\s*(assistant|ai|助手)\s*[】\]]/i;
-
 const USER_RE =
   /^\s*(#{1,6}\s*)?(user|human|用户|我|问|提问)\s*[:：]|^\s*[【\[]\s*(user|human|用户|我)\s*[】\]]/i;
 const ASSIST_RE =
@@ -1495,6 +1529,7 @@ function applyTokBar() {
   if (!on) {
     state.tok.view = false;
     state.tok.full = false;
+    state.tok.sel = null;
   }
   $('#btn-tok-view').classList.toggle('active', on && state.tok.view);
   $('#btn-tok-full').classList.toggle('hidden', !(on && state.tok.view));
@@ -1508,11 +1543,14 @@ function scheduleTokRender() {
   tokTimer = setTimeout(renderTokViews, 350);
 }
 
-/** 把每个轮次的正文渲染成着色的 token 序列 */
+/** 把每个轮次的正文渲染成着色的 token 序列。
+ *  逐字符渲染成可点击的小块：点击选中（反色），相邻的字连点扩选，
+ *  非相邻拒绝；点「选中文字加入分词器」才真正进词汇表。 */
 async function renderTokViews() {
   const show = state.tok.view && tokEnabled();
   const views = $$('#turns .tok-view');
   views.forEach((v) => v.classList.add('hidden'));
+  state.tok.sel = null; // 重建 DOM，旧选区作废
   if (!show || !views.length) return;
 
   const color = (state.settings && state.settings.uncovered_color) || '#e06c75';
@@ -1524,6 +1562,7 @@ async function renderTokViews() {
     const text = ((state.turns || [])[i] || {}).content || '';
     el.classList.remove('hidden');
     el.textContent = '…';
+    el._tokChars = null;
     if (!text.trim()) {
       el.textContent = '（空，无内容可分词）';
       continue;
@@ -1533,25 +1572,66 @@ async function renderTokViews() {
       totalCov += r.covered_chars;
       totalChars += r.total_chars;
       el.textContent = '';
+      // 逐字符拆开渲染，chars[k] 与第 k 个小块一一对应（取词时直接切片）
+      const chars = [];
       for (const s of r.spans) {
-        const sp = document.createElement('span');
-        sp.textContent = s.text;
-        if (!s.covered) {
-          sp.className = 'tok-uncovered';
-          sp.style.color = color;
-          sp.title = `「${s.text}」不在词汇表里，点击加入`;
-          sp.onclick = () => addVocabWords([s.text]);
-        } else if (state.tok.full) {
-          sp.style.color = tokenColor(s.text);
+        const tokenColorCss = s.covered && state.tok.full ? tokenColor(s.text) : null;
+        for (const ch of Array.from(s.text)) {
+          const k = chars.length;
+          chars.push(ch);
+          const sp = document.createElement('span');
+          sp.className = 'tok-ch' + (s.covered ? '' : ' tok-uncovered');
+          sp.textContent = ch;
+          if (!s.covered) sp.style.color = color;
+          else if (tokenColorCss) sp.style.color = tokenColorCss;
+          sp.dataset.k = k;
+          sp.onclick = () => onTokCharClick(i, k);
+          el.appendChild(sp);
         }
-        el.appendChild(sp);
       }
+      el._tokChars = chars;
     } catch (e) {
       el.textContent = '分词失败：' + e;
     }
   }
   const pct = totalChars ? ((totalCov / totalChars) * 100).toFixed(1) : '0.0';
   $('#tok-ratio').textContent = `覆盖率 ${pct}%`;
+}
+
+/** 分词视图里点了一个字：无选区→选中；相邻→扩选；非相邻→拒绝；点已选→取消 */
+function onTokCharClick(turn, k) {
+  const sel = state.tok.sel;
+  if (!sel) {
+    state.tok.sel = { turn, a: k, b: k };
+  } else if (sel.turn !== turn) {
+    toast('只能选同一轮里的字，先把这轮的词加完或点已选的字取消', false);
+    return;
+  } else if (k === sel.a - 1) {
+    sel.a = k;
+  } else if (k === sel.b + 1) {
+    sel.b = k;
+  } else if (k >= sel.a && k <= sel.b) {
+    state.tok.sel = null;
+    toast('已取消选择');
+    updateTokSelDom();
+    return;
+  } else {
+    toast('不相邻：只能点已选字两边的字来连选', false);
+    return;
+  }
+  updateTokSelDom();
+}
+
+/** 只切换 class，不重新分词 */
+function updateTokSelDom() {
+  const sel = state.tok.sel;
+  $$('#turns .tok-view').forEach((v, i) => {
+    v.querySelectorAll('.tok-ch').forEach((sp) => {
+      const k = +sp.dataset.k;
+      const on = !!sel && sel.turn === i && k >= sel.a && k <= sel.b;
+      sp.classList.toggle('sel', on);
+    });
+  });
 }
 
 async function addVocabWords(words) {
@@ -1588,7 +1668,7 @@ async function renderVocabList() {
     const box = $('#s-vocab-list');
     box.innerHTML = '';
     if (!words.length) {
-      box.innerHTML = '<p class="hint">还没有词。可以在录入页选中一段文字加入，或在分词视图里点未覆盖的字。</p>';
+      box.innerHTML = '<p class="hint">还没有词。打开「观察分词」后点字选择（相邻连选），再点「选中文字加入分词器」。</p>';
       return;
     }
     words.forEach((w) => {
@@ -1733,11 +1813,13 @@ function bind() {
     const ids = Array.from(state.selected);
     if (!ids.length) return;
     if (!confirm(`确定删除选中的 ${ids.length} 条？删掉就找不回来了。`)) return;
-    for (const id of ids) {
-      await B.remove(id);
+    try {
+      await B.removeMany(ids); // 一次命令批量删，别逐条循环
+      state.selected.clear();
+      toast('已删除');
+    } catch (e) {
+      toast('删除失败：' + e, false);
     }
-    state.selected.clear();
-    toast('已删除');
     refreshList();
     refreshStats();
   };
@@ -1875,17 +1957,27 @@ function bind() {
     renderTokViews();
   };
   $('#btn-tok-addsel').onclick = () => {
-    const ta = state.lastTa;
-    if (!ta) {
-      toast('先在一个输入框里选中一段文字', false);
-      return;
-    }
-    const sel = ta.value.substring(ta.selectionStart, ta.selectionEnd).trim();
+    const sel = state.tok.sel;
     if (!sel) {
-      toast('先选中一段文字（拖蓝或双击选词）', false);
+      toast('先在分词视图里点字：相邻的字连着点就选上了', false);
       return;
     }
-    addVocabWords(sel.split(/\s+/));
+    const view = $$('#turns .tok-view')[sel.turn];
+    const chars = view && view._tokChars;
+    if (!chars) {
+      toast('分词视图还没渲染好，稍等一下再试', false);
+      return;
+    }
+    const word = chars.slice(sel.a, sel.b + 1).join('').trim();
+    if (!word) {
+      toast('选中的都是空白', false);
+      return;
+    }
+    if ([...word].length < 2) {
+      toast('分词器不收录单个字，再点一个相邻的字凑成词', false);
+      return;
+    }
+    addVocabWords([word]);
   };
 
   /* ---- 设置页 ---- */

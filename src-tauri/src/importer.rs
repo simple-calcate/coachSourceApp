@@ -351,11 +351,10 @@ pub fn import_file(app: AppHandle, path: String) -> Result<ImportResult, String>
                     .to_string_lossy()
                     .to_string();
                 fs::write(img_tmp.join(fname), buf).map_err(|e| e.to_string())?;
-            } else if name.ends_with(".jsonl") || name.ends_with(".json") {
-                if jsonl_text.is_none() {
+            } else if (name.ends_with(".jsonl") || name.ends_with(".json"))
+                && jsonl_text.is_none() {
                     jsonl_text = Some(String::from_utf8_lossy(&buf).to_string());
                 }
-            }
         }
 
         let content = jsonl_text.ok_or_else(|| "压缩包里没有找到 .jsonl 文件".to_string())?;

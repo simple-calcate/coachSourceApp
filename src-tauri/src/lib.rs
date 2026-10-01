@@ -40,13 +40,9 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            // 第一次运行时把数据目录建出来
-            let handle = app.handle().clone();
-            std::thread::spawn(move || {
-                if let Err(e) = store::init_dirs(&handle) {
-                    eprintln!("初始化数据目录失败: {}", e);
-                }
-            });
+            // 第一次运行时把数据目录建出来。就几个 create_dir_all，毫秒级，
+            // 直接同步做——放后台线程反而有"前端抢在目录建好前读写"的竞态。
+            store::init_dirs(app.handle())?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -56,6 +52,7 @@ pub fn run() {
             store::get_record,
             store::save_record,
             store::delete_record,
+            store::delete_records,
             store::save_image,
             store::delete_image,
             store::mark_exported,

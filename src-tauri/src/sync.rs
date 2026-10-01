@@ -201,12 +201,17 @@ pub struct SyncReport {
 
 /* ------------------------------ HTTP ------------------------------ */
 
-fn http() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .user_agent("coach-source-app")
-        .timeout(std::time::Duration::from_secs(1800))
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败：{}", e))
+/// 全局复用一个 Client：连接池 + keep-alive，避免每个请求都重新握手。
+/// timeout 给到 30 分钟——上传 100MB 分片在慢网络下就是要这么久。
+fn http() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent("coach-source-app")
+            .timeout(std::time::Duration::from_secs(1800))
+            .build()
+            .unwrap_or_default()
+    })
 }
 
 fn auth(cfg: &GithubConfig) -> String {
@@ -257,7 +262,7 @@ fn enrich_perm_error(e: String) -> String {
 
 async fn gh_get(cfg: &GithubConfig, path: &str) -> Result<serde_json::Value, String> {
     let url = format!("{}{}", API, path);
-    let resp = http()?
+    let resp = http()
         .get(&url)
         .header("Authorization", auth(cfg))
         .header("Accept", "application/vnd.github+json")
@@ -280,7 +285,7 @@ async fn gh_send<T: serde::Serialize>(
     body: &T,
 ) -> Result<serde_json::Value, String> {
     let url = format!("{}{}", API, path);
-    let resp = http()?
+    let resp = http()
         .request(method, &url)
         .header("Authorization", auth(cfg))
         .header("Accept", "application/vnd.github+json")
@@ -325,7 +330,7 @@ async fn device_post(params: &[(&str, String)]) -> Result<serde_json::Value, Str
     for (k, v) in params {
         form.insert(k, v.clone());
     }
-    let resp = http()?
+    let resp = http()
         .post(DEVICE_TOKEN_URL)
         .header("Accept", "application/json")
         .header("X-GitHub-Api-Version", "2022-11-28")
@@ -358,7 +363,7 @@ pub async fn github_device_start(client_id: String) -> Result<DeviceStart, Strin
                 .to_string(),
         );
     }
-    let resp = http()?
+    let resp = http()
         .post(DEVICE_CODE_URL)
         .header("Accept", "application/json")
         .form(&[("client_id", cid.to_string()), ("scope", "repo".to_string())])
@@ -461,16 +466,36 @@ pub fn github_logout(app: AppHandle) -> Result<GithubConfig, String> {
     Ok(cfg)
 }
 
-/// 文件已经存在的话，更新时必须带上它当前的 sha
-async fn existing_sha(cfg: &GithubConfig, path: &str) -> Result<Option<String>, String> {
+/// 列出仓库里某个目录下的文件清单：文件名 → 该文件当前的 git blob sha。
+/// 一次调用拿到整个批次的状态，后面上传时用它做断点续传：
+/// 远端 sha 与本地内容一致就跳过，不一致就带上 sha 覆盖更新。
+/// 目录不存在（还没同步过）或为空时返回空 map。
+async fn list_remote_dir(
+    cfg: &GithubConfig,
+    dir: &str,
+) -> Result<std::collections::HashMap<String, String>, String> {
     let p = format!(
         "/repos/{}/{}/contents/{}?ref={}",
-        cfg.owner, cfg.repo, path, cfg.branch
+        cfg.owner, cfg.repo, dir, cfg.branch
     );
-    match gh_get(cfg, &p).await {
-        Ok(v) => Ok(v.get("sha").and_then(|x| x.as_str()).map(|s| s.to_string())),
-        Err(_) => Ok(None), // 404 就是还没有这个文件
+    let v = match gh_get(cfg, &p).await {
+        Ok(v) => v,
+        Err(_) => return Ok(std::collections::HashMap::new()), // 404 = 目录还不存在
+    };
+    let mut m = std::collections::HashMap::new();
+    if let Some(arr) = v.as_array() {
+        for it in arr {
+            let is_file = it.get("type").and_then(|x| x.as_str()) == Some("file");
+            if let (true, Some(n), Some(s)) = (
+                is_file,
+                it.get("name").and_then(|x| x.as_str()),
+                it.get("sha").and_then(|x| x.as_str()),
+            ) {
+                m.insert(n.to_string(), s.to_string());
+            }
+        }
     }
+    Ok(m)
 }
 
 async fn put_file(
@@ -478,6 +503,9 @@ async fn put_file(
     path: &str,
     bytes: &[u8],
     message: &str,
+    // 远端已存在的同名文件 sha（由调用方从 list_remote_dir 查好传入），
+    // 带上它 GitHub 才允许覆盖更新。
+    existing: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     use base64::Engine;
     if bytes.len() as u64 >= FILE_LIMIT {
@@ -492,7 +520,7 @@ async fn put_file(
     body.insert("message".into(), json!(message));
     body.insert("content".into(), json!(b64));
     body.insert("branch".into(), json!(cfg.branch));
-    if let Some(sha) = existing_sha(cfg, path).await? {
+    if let Some(sha) = existing {
         body.insert("sha".into(), json!(sha));
     }
     gh_send(
@@ -513,7 +541,7 @@ pub fn git_blob_sha1(bytes: &[u8]) -> String {
     let mut h = Sha1::new();
     h.update(b"blob ");
     h.update(bytes.len().to_string().as_bytes());
-    h.update(&[0u8]);
+    h.update([0u8]);
     h.update(bytes);
     format!("{:x}", h.finalize())
 }
@@ -591,16 +619,15 @@ fn build_image_shards(
     src_dir: &Path,
     limit: usize,
 ) -> Result<Vec<RawShard>, String> {
-    let mut names: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for r in records {
         for t in &r.turns {
             for n in &t.images {
-                if !names.contains(n) {
-                    names.push(n.clone());
-                }
+                seen.insert(n.clone());
             }
         }
     }
+    let mut names: Vec<String> = seen.into_iter().collect();
     names.sort();
     if names.is_empty() {
         return Ok(Vec::new());
@@ -777,17 +804,11 @@ pub async fn github_sync(
     }
 
     let stamp = chrono::Local::now().format("%Y-%m-%d").to_string();
-    // 同一天同步多次时加后缀，避免覆盖掉上一次
-    let batch = {
-        let mut b = stamp.clone();
-        let mut i = 2usize;
-        while dir_exists_in_repo(&cfg, &b).await.unwrap_or(false) {
-            b = format!("{}-{}", stamp, i);
-            i += 1;
-        }
-        b
-    };
+    // 一天一个目录，重试时复用：已上传且内容没变的分片直接跳过（断点续传），
+    // 内容变了（比如当天又录了新对话）就覆盖更新，始终代表"当天最新全量"。
+    let batch = stamp;
     let base = format!("data/{}", batch);
+    let remote = list_remote_dir(&cfg, &base).await?;
 
     emit(
         "preparing",
@@ -855,14 +876,22 @@ pub async fn github_sync(
     let mut image_shards: Vec<ShardInfo> = Vec::new();
 
     for s in &jsonl_shards {
-        emit(
-            "uploading",
-            format!("上传 {}", s.name),
-            done,
-            total_files,
-        );
         let path = format!("{}/{}", base, s.name);
-        put_file(&cfg, &path, &s.bytes, &format!("同步 {} · {}", batch, s.name)).await?;
+        let local_blob = git_blob_sha1(&s.bytes);
+        let same = remote.get(&s.name).map(|r| r == &local_blob).unwrap_or(false);
+        if same {
+            emit("uploading", format!("{} 内容没变，跳过", s.name), done, total_files);
+        } else {
+            emit("uploading", format!("上传 {}", s.name), done, total_files);
+            put_file(
+                &cfg,
+                &path,
+                &s.bytes,
+                &format!("同步 {} · {}", batch, s.name),
+                remote.get(&s.name).map(|x| x.as_str()),
+            )
+            .await?;
+        }
         fs::write(local_dir.join(&s.name), &s.bytes).map_err(|e| e.to_string())?;
         done += 1;
         shards.push(ShardInfo {
@@ -870,15 +899,28 @@ pub async fn github_sync(
             path: path.clone(),
             bytes: s.bytes.len() as u64,
             count: s.count,
-            sha1: git_blob_sha1(&s.bytes),
+            sha1: local_blob,
             url: raw_url(&cfg, &path),
         });
     }
 
     for s in &img_shards {
-        emit("uploading", format!("上传 {}", s.name), done, total_files);
         let path = format!("{}/{}", base, s.name);
-        put_file(&cfg, &path, &s.bytes, &format!("同步 {} · {}", batch, s.name)).await?;
+        let local_blob = git_blob_sha1(&s.bytes);
+        let same = remote.get(&s.name).map(|r| r == &local_blob).unwrap_or(false);
+        if same {
+            emit("uploading", format!("{} 内容没变，跳过", s.name), done, total_files);
+        } else {
+            emit("uploading", format!("上传 {}", s.name), done, total_files);
+            put_file(
+                &cfg,
+                &path,
+                &s.bytes,
+                &format!("同步 {} · {}", batch, s.name),
+                remote.get(&s.name).map(|x| x.as_str()),
+            )
+            .await?;
+        }
         fs::write(local_dir.join(&s.name), &s.bytes).map_err(|e| e.to_string())?;
         done += 1;
         image_shards.push(ShardInfo {
@@ -886,7 +928,7 @@ pub async fn github_sync(
             path: path.clone(),
             bytes: s.bytes.len() as u64,
             count: s.count,
-            sha1: git_blob_sha1(&s.bytes),
+            sha1: local_blob,
             url: raw_url(&cfg, &path),
         });
     }
@@ -894,18 +936,28 @@ pub async fn github_sync(
     /* 2.5 字典树 */
     let mut trie_shard: Option<ShardInfo> = None;
     if let Some((bytes, mut info)) = trie_info {
-        emit("uploading", "上传 tokenizer_trie.json".into(), done, total_files);
-        put_file(
-            &cfg,
-            &info.path,
-            &bytes,
-            &format!("同步 {} · 分词器字典树", batch),
-        )
-        .await?;
+        let local_blob = git_blob_sha1(&bytes);
+        let same = remote
+            .get("tokenizer_trie.json")
+            .map(|r| r == &local_blob)
+            .unwrap_or(false);
+        if same {
+            emit("uploading", "字典树没变，跳过".into(), done, total_files);
+        } else {
+            emit("uploading", "上传 tokenizer_trie.json".into(), done, total_files);
+            put_file(
+                &cfg,
+                &info.path,
+                &bytes,
+                &format!("同步 {} · 分词器字典树", batch),
+                remote.get("tokenizer_trie.json").map(|x| x.as_str()),
+            )
+            .await?;
+        }
         fs::write(local_dir.join("tokenizer_trie.json"), &bytes).map_err(|e| e.to_string())?;
         done += 1;
         info.bytes = bytes.len() as u64;
-        info.sha1 = git_blob_sha1(&bytes);
+        info.sha1 = local_blob;
         info.url = raw_url(&cfg, &info.path);
         trie_shard = Some(info);
     }
@@ -938,6 +990,7 @@ pub async fn github_sync(
         &manifest_path,
         &manifest_bytes,
         &format!("同步 {} · manifest", batch),
+        remote.get("manifest.json").map(|x| x.as_str()),
     )
     .await?;
     fs::write(local_dir.join("manifest.json"), &manifest_bytes).map_err(|e| e.to_string())?;
@@ -1047,14 +1100,6 @@ async fn verify_remote(
         ));
     }
     Ok(())
-}
-
-async fn dir_exists_in_repo(cfg: &GithubConfig, batch: &str) -> Result<bool, String> {
-    let p = format!(
-        "/repos/{}/{}/contents/data/{}?ref={}",
-        cfg.owner, cfg.repo, batch, cfg.branch
-    );
-    Ok(gh_get(cfg, &p).await.is_ok())
 }
 
 /* ------------------------------ 测试 ------------------------------ */

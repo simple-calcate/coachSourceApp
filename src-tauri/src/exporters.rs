@@ -136,11 +136,10 @@ pub fn export_data(
     filename: Option<String>,
     target_dir: Option<String>,
 ) -> Result<ExportResult, String> {
-    let all = store::load_all(&app)?;
-    let mut all_sorted = all.clone();
-    all_sorted.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    let mut all = store::load_all(&app)?;
+    all.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
-    let selected: Vec<Record> = all_sorted
+    let selected: Vec<Record> = all
         .into_iter()
         .filter(|r| scope != "pending" || r.exported_at.is_none())
         .collect();
@@ -325,8 +324,7 @@ pub fn mirror(app: AppHandle) -> Result<Vec<String>, String> {
     let dir = store::data_dir(&app)?;
     let mut written = Vec::new();
 
-    let all = store::load_all(&app)?;
-    let mut sorted = all.clone();
+    let mut sorted = store::load_all(&app)?;
     sorted.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
     let (sft, _) = build_jsonl(&sorted, "sft", false);

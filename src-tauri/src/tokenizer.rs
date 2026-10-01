@@ -292,10 +292,34 @@ pub fn write_export(app: &AppHandle, dir: &Path) -> Result<Option<std::path::Pat
 
 /* ------------------------------ 命令 ------------------------------ */
 
+/// trie 内存缓存：分词观察开着的时候每敲一段字就 analyze 一次，
+/// 不能每次都读盘 + 重建整棵树。加词 / 删词 / 导入成功后主动失效。
+static TRIE_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<std::sync::Arc<TrieNode>>>> =
+    std::sync::OnceLock::new();
+
+fn cached_trie(app: &AppHandle) -> Result<std::sync::Arc<TrieNode>, String> {
+    let cell = TRIE_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = cell.lock().map_err(|_| "分词缓存锁坏了".to_string())?;
+    if let Some(t) = guard.as_ref() {
+        return Ok(t.clone());
+    }
+    let words = load_vocab(app)?;
+    let t = std::sync::Arc::new(TrieNode::build(words.iter().map(|w| w.word.as_str())));
+    *guard = Some(t.clone());
+    Ok(t)
+}
+
+fn invalidate_trie_cache() {
+    if let Some(cell) = TRIE_CACHE.get() {
+        if let Ok(mut g) = cell.lock() {
+            *g = None;
+        }
+    }
+}
+
 #[tauri::command]
 pub fn tokenizer_analyze(app: AppHandle, text: String) -> Result<TokenizeResult, String> {
-    let words = load_vocab(&app)?;
-    let root = TrieNode::build(words.iter().map(|w| w.word.as_str()));
+    let root = cached_trie(&app)?;
     Ok(tokenize(&text, &root))
 }
 
@@ -306,17 +330,23 @@ pub fn tokenizer_vocab(app: AppHandle) -> Result<Vec<VocabWord>, String> {
     Ok(words)
 }
 
-/// 批量加词，自动去重清洗。返回真正新增的数量。
-#[tauri::command]
-pub fn tokenizer_add_words(app: AppHandle, words: Vec<String>) -> Result<usize, String> {
-    let mut vocab = load_vocab(&app)?;
+/// 加词的核心逻辑（不碰文件，便于单测）：清洗、去重、拒绝单字。
+///
+/// 不收录单个字：单字对最大前缀匹配没有增益（任何字都能单独成"词"），
+/// 全是单字的调用直接报错；混着单字时忽略单字、只加多字的。
+fn merge_words(vocab: &mut Vec<VocabWord>, words: Vec<String>) -> Result<usize, String> {
     let mut existing: std::collections::HashSet<String> =
         vocab.iter().map(|w| w.word.clone()).collect();
 
     let ts = now();
-    let mut added = 0usize;
+    let (mut added, mut multi, mut singles) = (0usize, 0usize, 0usize);
     for raw in words {
         let Some(w) = clean_word(&raw) else { continue };
+        if w.chars().count() < 2 {
+            singles += 1;
+            continue;
+        }
+        multi += 1;
         if existing.contains(&w) {
             continue;
         }
@@ -327,8 +357,20 @@ pub fn tokenizer_add_words(app: AppHandle, words: Vec<String>) -> Result<usize, 
         });
         added += 1;
     }
+    if multi == 0 && singles > 0 {
+        return Err("分词器不收录单个字，请选择两个及以上的相邻字".to_string());
+    }
+    Ok(added)
+}
+
+/// 批量加词，自动去重清洗。返回真正新增的数量。
+#[tauri::command]
+pub fn tokenizer_add_words(app: AppHandle, words: Vec<String>) -> Result<usize, String> {
+    let mut vocab = load_vocab(&app)?;
+    let added = merge_words(&mut vocab, words)?;
     vocab.sort_by(|a, b| a.word.cmp(&b.word));
     save_vocab(&app, &vocab)?;
+    invalidate_trie_cache();
     Ok(added)
 }
 
@@ -341,6 +383,7 @@ pub fn tokenizer_remove_words(app: AppHandle, words: Vec<String>) -> Result<usiz
         words.into_iter().filter_map(|w| clean_word(&w)).collect();
     vocab.retain(|v| !rm.contains(&v.word));
     save_vocab(&app, &vocab)?;
+    invalidate_trie_cache();
     Ok(before - vocab.len())
 }
 
@@ -470,5 +513,24 @@ mod tests {
         assert_eq!(clean_word(""), None);
         let long: String = std::iter::repeat_n("长", 33).collect();
         assert_eq!(clean_word(&long), None, "超过 32 字的当误粘处理，拒绝");
+    }
+
+    #[test]
+    fn merge_words_rejects_all_singles() {
+        let mut v = vocab(&[]);
+        let r = merge_words(&mut v, vec!["字".into(), " a ".into()]);
+        assert!(r.is_err(), "全是单字必须报错，不能静默收录");
+        assert!(v.is_empty());
+        let r = merge_words(&mut v, vec!["词".into(), "  ".into()]);
+        assert!(r.is_err(), "清洗后只剩单字同样报错");
+    }
+
+    #[test]
+    fn merge_words_skips_singles_but_keeps_multi() {
+        let mut v = vocab(&["已有"]);
+        let r = merge_words(&mut v, vec!["字".into(), "新词".into(), "已有".into()]);
+        assert_eq!(r.unwrap(), 1, "忽略单字和重复，只新增「新词」");
+        assert_eq!(v.len(), 2);
+        assert!(v.iter().any(|w| w.word == "新词"));
     }
 }

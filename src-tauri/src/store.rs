@@ -181,6 +181,32 @@ pub fn delete_record(app: AppHandle, id: String) -> Result<(), String> {
     save_all(&app, &rs)
 }
 
+/// 批量删除：一次读写完成，别在前端逐条循环（每条都是全量读写，选中
+/// 一两百条时既慢又放大意外断电丢数据的风险）。返回实际删掉的条数。
+#[tauri::command]
+pub fn delete_records(app: AppHandle, ids: Vec<String>) -> Result<usize, String> {
+    let mut rs = load_all(&app)?;
+    let before = rs.len();
+    let idir = image_dir(&app)?;
+    rs.retain(|r| {
+        if ids.contains(&r.id) {
+            for t in &r.turns {
+                for name in &t.images {
+                    let _ = fs::remove_file(idir.join(name));
+                }
+            }
+            false
+        } else {
+            true
+        }
+    });
+    let n = before - rs.len();
+    if n > 0 {
+        save_all(&app, &rs)?;
+    }
+    Ok(n)
+}
+
 /// 接收前端传来的 base64 图片，落到 images 目录，返回文件名
 #[tauri::command]
 pub fn save_image(app: AppHandle, ext: String, data_base64: String) -> Result<String, String> {

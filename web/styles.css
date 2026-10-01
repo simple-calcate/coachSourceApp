@@ -509,6 +509,16 @@ button.linkbtn {
 }
 .tok-uncovered:hover { opacity: 0.75; }
 
+/* 逐字符小块都可点击选中；选中 = 反色（页面底色和文字色互换） */
+.tok-ch { cursor: pointer; border-radius: 2px; }
+.tok-ch.sel {
+  background: var(--text);
+  color: var(--bg);
+  border-bottom-color: transparent;
+  opacity: 1;
+}
+.tok-ch.tok-uncovered.sel { border-bottom: none; }
+
 .colorrow { display: flex; gap: 8px; align-items: center; }
 .colorrow input[type='color'] {
   width: 46px;
