@@ -1,10 +1,12 @@
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
+use std::str::FromStr;
 
-use tauri::AppHandle;
-// 安卓 / iOS 没有系统文件对话框，DialogExt 只在桌面端引入
-#[cfg(desktop)]
+use tauri::{AppHandle, Manager};
+// 桌面和手机都有系统文件选择器（Android 上走 SAF，返回 content:// URI）
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_fs::FsExt;
 
 use crate::model::{Record, Turn};
 use crate::store;
@@ -307,88 +309,128 @@ pub fn import_text(app: AppHandle, content: String) -> Result<ImportResult, Stri
     merge(&app, incoming, None)
 }
 
-/// 从文件路径导入，支持 .jsonl / .json / .txt / .zip（zip 里带图片）
+/// 从文件路径导入，支持 .jsonl / .json / .txt / .zip（zip 里带图片）。
+/// 手机上系统选择器给的是 content:// URI，同样走这条路。
 #[tauri::command]
 pub fn import_file(app: AppHandle, path: String) -> Result<ImportResult, String> {
-    let p = PathBuf::from(&path);
-    if !p.exists() {
-        return Err("文件不存在".to_string());
-    }
+    let name = app
+        .path()
+        .file_name(&path)
+        .unwrap_or_else(|| path.clone());
 
-    let ext = p
+    let reader: Box<dyn Read> = if path.starts_with("content://") {
+        // SAF 给的 URI 用 fs 插件打开：底层是 ContentResolver 的文件描述符
+        let mut opts = tauri_plugin_fs::OpenOptions::new();
+        opts.read(true);
+        let fp = tauri_plugin_fs::FilePath::from_str(&path).expect("FilePath 解析不会失败");
+        let f = app
+            .fs()
+            .open(fp, opts)
+            .map_err(|e| format!("无法读取所选文件：{}", e))?;
+        Box::new(f)
+    } else {
+        let p = PathBuf::from(&path);
+        if !p.exists() {
+            return Err("文件不存在".to_string());
+        }
+        Box::new(fs::File::open(&p).map_err(|e| e.to_string())?)
+    };
+
+    let ext = PathBuf::from(&name)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
 
-    if ext == "zip" {
-        let tmp = std::env::temp_dir().join(format!(
-            "coachsource_import_{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
-
-        let f = fs::File::open(&p).map_err(|e| e.to_string())?;
-        let mut archive = zip::ZipArchive::new(f).map_err(|e| format!("zip 解压失败：{}", e))?;
-
-        let mut jsonl_text: Option<String> = None;
-        let img_tmp = tmp.join("images");
-        fs::create_dir_all(&img_tmp).map_err(|e| e.to_string())?;
-
-        for i in 0..archive.len() {
-            let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
-            let name = entry.name().to_string();
-            if entry.is_dir() {
-                continue;
-            }
-            let mut buf = Vec::new();
-            std::io::Read::read_to_end(&mut entry, &mut buf).map_err(|e| e.to_string())?;
-
-            if name.starts_with("images/") {
-                let fname = PathBuf::from(&name)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                fs::write(img_tmp.join(fname), buf).map_err(|e| e.to_string())?;
-            } else if (name.ends_with(".jsonl") || name.ends_with(".json"))
-                && jsonl_text.is_none() {
-                    jsonl_text = Some(String::from_utf8_lossy(&buf).to_string());
-                }
-        }
-
-        let content = jsonl_text.ok_or_else(|| "压缩包里没有找到 .jsonl 文件".to_string())?;
-        let incoming = parse_text(&content);
-        let res = merge(&app, incoming, Some(img_tmp))?;
-        let _ = fs::remove_dir_all(&tmp);
-        return Ok(res);
-    }
-
-    let content = fs::read_to_string(&p).map_err(|e| e.to_string())?;
-    let incoming = parse_text(&content);
-    merge(&app, incoming, None)
+    import_reader(app, reader, &ext)
 }
 
-/// 弹出文件选择框，返回选中的路径（仅桌面端）
-#[cfg(desktop)]
+fn import_reader(
+    app: AppHandle,
+    mut reader: Box<dyn Read>,
+    ext: &str,
+) -> Result<ImportResult, String> {
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+
+    if ext == "zip" {
+        import_zip(&app, &bytes)
+    } else {
+        let content = String::from_utf8_lossy(&bytes).to_string();
+        let incoming = parse_text(&content);
+        merge(&app, incoming, None)
+    }
+}
+
+fn import_zip(app: &AppHandle, bytes: &[u8]) -> Result<ImportResult, String> {
+    // 注意别用 std::env::temp_dir()：Android 上那是 /data/local/tmp，应用没权限写
+    let tmp = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| e.to_string())?
+        .join(format!("coachsource_import_{}", uuid::Uuid::new_v4().simple()));
+    fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
+
+    let f = std::io::Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(f).map_err(|e| format!("zip 解压失败：{}", e))?;
+
+    let mut jsonl_text: Option<String> = None;
+    let img_tmp = tmp.join("images");
+    fs::create_dir_all(&img_tmp).map_err(|e| e.to_string())?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+        let name = entry.name().to_string();
+        if entry.is_dir() {
+            continue;
+        }
+        let mut buf = Vec::new();
+        entry.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+
+        if name.starts_with("images/") {
+            let fname = PathBuf::from(&name)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            fs::write(img_tmp.join(fname), buf).map_err(|e| e.to_string())?;
+        } else if (name.ends_with(".jsonl") || name.ends_with(".json")) && jsonl_text.is_none() {
+            jsonl_text = Some(String::from_utf8_lossy(&buf).to_string());
+        }
+    }
+
+    let content = jsonl_text.ok_or_else(|| "压缩包里没有找到 .jsonl 文件".to_string())?;
+    let incoming = parse_text(&content);
+    let res = merge(app, incoming, Some(img_tmp));
+    let _ = fs::remove_dir_all(&tmp);
+    res
+}
+
+/// 弹出文件选择框，返回选中的路径 / content:// URI
 #[tauri::command]
 pub fn pick_import_file(app: AppHandle) -> Result<Option<String>, String> {
-    let picked = app
-        .dialog()
-        .file()
-        .add_filter("训练数据", &["jsonl", "json", "zip", "txt"])
-        .blocking_pick_file();
+    let picked = pick_import_dialog(&app);
     Ok(picked.map(|p| p.to_string()))
 }
 
-/// 手机端没有系统文件对话框，返回空让前端走「粘贴文本导入」
-#[cfg(mobile)]
-#[tauri::command]
-pub fn pick_import_file(_app: AppHandle) -> Result<Option<String>, String> {
-    Ok(None)
+#[cfg(desktop)]
+fn pick_import_dialog(
+    app: &AppHandle,
+) -> Option<tauri_plugin_dialog::FilePath> {
+    app.dialog()
+        .file()
+        .add_filter("训练数据", &["jsonl", "json", "zip", "txt"])
+        .blocking_pick_file()
 }
 
-/// 弹出目录选择框（仅桌面端）
+#[cfg(mobile)]
+fn pick_import_dialog(app: &AppHandle) -> Option<tauri_plugin_dialog::FilePath> {
+    // 手机端不能加扩展名过滤：系统选择器按 MIME 匹配，
+    // .jsonl 没有登记过的 MIME 类型，加了过滤反而会被藏起来
+    app.dialog().file().blocking_pick_file()
+}
+
+/// 桌面端选导出目录
 #[cfg(desktop)]
 #[tauri::command]
 pub fn pick_export_dir(app: AppHandle) -> Result<Option<String>, String> {
@@ -396,9 +438,22 @@ pub fn pick_export_dir(app: AppHandle) -> Result<Option<String>, String> {
     Ok(picked.map(|p| p.to_string()))
 }
 
-/// 手机端不支持选择导出目录，一律导出到应用自己的 export 目录
+/// 手机端没有目录选择器，用系统「另存为」代替：用户挑好位置后
+/// 返回一个 content:// URI，export_data 会把导出的主文件写进去
 #[cfg(mobile)]
 #[tauri::command]
-pub fn pick_export_dir(_app: AppHandle) -> Result<Option<String>, String> {
-    Ok(None)
+pub fn pick_export_dir(
+    app: AppHandle,
+    suggested_name: Option<String>,
+) -> Result<Option<String>, String> {
+    let picked = app
+        .dialog()
+        .file()
+        .set_file_name(
+            suggested_name
+                .as_deref()
+                .unwrap_or("coachsource_export.jsonl"),
+        )
+        .blocking_save_file();
+    Ok(picked.map(|p| p.to_string()))
 }

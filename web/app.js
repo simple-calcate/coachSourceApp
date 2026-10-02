@@ -9,6 +9,8 @@
 
 const T = window.__TAURI_INTERNALS__;
 const IS_TAURI = !!T;
+// Tauri 安卓版的 WebView UA 里带 Android；据此区分「打开目录」等桌面专属交互
+const IS_ANDROID = IS_TAURI && /android/i.test(navigator.userAgent);
 
 async function invoke(cmd, args) {
   if (!IS_TAURI) throw new Error('不在 Tauri 环境中');
@@ -364,7 +366,7 @@ const B = {
   async saveImage(dataUrl) {
     const ext = (dataUrl.match(/data:image\/(\w+)/) || [, 'jpg'])[1];
     const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
-    if (IS_TAURI) return invoke('save_image', { ext, data_base64: b64 });
+    if (IS_TAURI) return invoke('save_image', { ext, dataBase64: b64 });
     const name = 'img_' + Math.random().toString(36).slice(2, 10) + '.' + ext;
     localStorage.setItem(IMG_PREFIX + name, dataUrl);
     return name;
@@ -392,7 +394,7 @@ const B = {
     let rs = LocalBackend.load();
     if (opts.scope === 'pending') rs = rs.filter((r) => !r.exported_at);
     if (!rs.length) throw new Error('没有符合条件的记录');
-    const lines = rs.map((r) => buildLine(r, opts.format, opts.with_meta)).join('\n') + '\n';
+    const lines = rs.map((r) => buildLine(r, opts.format, opts.withMeta)).join('\n') + '\n';
     const enc = new TextEncoder();
     const base =
       opts.filename || (opts.format === 'pretrain' ? 'pretrain_t2t' : 'sft_t2t') + '_' + new Date().toISOString().slice(0, 10) + '.jsonl';
@@ -457,8 +459,8 @@ const B = {
     if (IS_TAURI) return invoke('pick_import_file');
     return null;
   },
-  async pickExportDir() {
-    if (IS_TAURI) return invoke('pick_export_dir');
+  async pickExportDir(suggestedName) {
+    if (IS_TAURI) return invoke('pick_export_dir', { suggestedName: suggestedName || null });
     return null;
   },
   /* ---- GitHub 云端同步（需要 Rust 后端，浏览器兜底模式下不可用） ---- */
@@ -1827,10 +1829,13 @@ function bind() {
   $('#btn-export').onclick = () => runExport(null);
   $('#btn-export-to').onclick = async () => {
     try {
-      const dir = await B.pickExportDir();
+      // 手机端没有目录选择器，走系统「另存为」，给个像样的默认文件名
+      const stamp = new Date().toISOString().slice(0, 10);
+      const name = ($('#e-format').value === 'pretrain' ? 'pretrain_t2t_' : 'sft_t2t_') + stamp + '.jsonl';
+      const dir = await B.pickExportDir(name);
       if (dir) runExport(dir);
     } catch (e) {
-      toast('选择目录失败：' + e, false);
+      toast('选择保存位置失败：' + e, false);
     }
   };
 
@@ -1846,6 +1851,16 @@ function bind() {
 
   $('#btn-open-dir').onclick = async () => {
     if (!state.config) return;
+    if (IS_ANDROID) {
+      // 手机上没有能接收「打开目录」的系统入口，把路径复制走最实用
+      try {
+        await navigator.clipboard.writeText(state.config.export_dir);
+        toast('手机打不开应用目录，导出目录路径已复制，可粘贴到文件管理器');
+      } catch (e) {
+        toast('导出目录：' + state.config.export_dir, false);
+      }
+      return;
+    }
     await B.reveal(state.config.export_dir);
   };
 
@@ -1903,9 +1918,9 @@ function bind() {
       const r = await B.export({
         format: 'sft',
         scope: 'all',
-        with_meta: true,
+        withMeta: true,
         filename: 'coachsource_backup_' + new Date().toISOString().slice(0, 10) + '.jsonl',
-        target_dir: null,
+        targetDir: null,
       });
       $('#e-result').textContent = `备份完成，共 ${r.count} 条${r.zip_path ? '（含图片，已打包 zip）' : ''}：${r.zip_path || r.path}`;
       toast('备份完成');
@@ -2039,16 +2054,21 @@ function bind() {
 }
 
 async function runExport(dir) {
+  // Tauri v2 的命令参数按 camelCase 匹配（with_meta 会被要求成 withMeta）
   const opts = {
     format: $('#e-format').value,
     scope: $('#e-scope').value,
-    with_meta: $('#e-meta').checked,
+    withMeta: $('#e-meta').checked,
     filename: null,
-    target_dir: dir,
+    targetDir: dir,
   };
   try {
     const r = await B.export(opts);
-    let msg = `已导出 ${r.count} 条 → ${r.zip_path || r.path}`;
+    // 手机「另存为」返回的是 content:// URI，又长又没法点，给句人话
+    const where = r.path.startsWith('content://')
+      ? '你选择的位置'
+      : (r.zip_path || r.path);
+    let msg = `已导出 ${r.count} 条 → ${where}`;
     if (r.skipped) msg += `（${r.skipped} 条含图片的记录在纯文本格式下被跳过）`;
     $('#e-result').textContent = msg;
     toast('导出完成');

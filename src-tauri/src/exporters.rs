@@ -1,8 +1,10 @@
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
+use tauri_plugin_fs::FsExt;
 
 use crate::model::Record;
 use crate::store;
@@ -127,6 +129,86 @@ fn make_zip(zip_path: &PathBuf, jsonl_name: &str, jsonl_bytes: &[u8], images_dir
     Ok(())
 }
 
+fn copy_used_images(
+    app: &AppHandle,
+    selected: &[Record],
+    img_out: &Path,
+) -> Result<(), String> {
+    fs::create_dir_all(img_out).map_err(|e| e.to_string())?;
+    let src_dir = store::image_dir(app)?;
+    for r in selected {
+        for t in &r.turns {
+            for name in &t.images {
+                let s = src_dir.join(name);
+                let d = img_out.join(name);
+                if s.exists() && !d.exists() {
+                    fs::copy(&s, &d).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 往 SAF content:// URI 里写全部字节（手机端「另存为」选中的位置）
+fn write_uri(app: &AppHandle, uri: &str, bytes: &[u8]) -> Result<(), String> {
+    let mut opts = tauri_plugin_fs::OpenOptions::new();
+    opts.write(true).truncate(true);
+    let fp = tauri_plugin_fs::FilePath::from_str(uri).expect("FilePath 解析不会失败");
+    let mut f = app
+        .fs()
+        .open(fp, opts)
+        .map_err(|e| format!("无法写入所选位置：{}", e))?;
+    f.write_all(bytes).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 手机端「另存为」：target 是用户在系统保存对话框里选中的 content:// URI。
+/// SAF 下只有这一个文件可写、建不了子目录，所以带图片时改写整个 zip 包；
+/// 分词器字典树不跟着走（设置页有单独的导出入口）。
+fn export_to_uri(
+    app: &AppHandle,
+    selected: &[Record],
+    jsonl: &str,
+    base: &str,
+    uri: &str,
+    has_images: bool,
+    wants_zip: bool,
+    skipped: usize,
+) -> Result<ExportResult, String> {
+    let payload: Vec<u8> = if wants_zip {
+        // zip 需要可 Seek 的文件，先在应用缓存里落盘，再整个拷进 URI
+        let tmp = app
+            .path()
+            .app_cache_dir()
+            .map_err(|e| e.to_string())?
+            .join(format!(
+                "coachsource_export_{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+        let img_tmp = tmp.join("images");
+        copy_used_images(app, selected, &img_tmp)?;
+        let zip_path = tmp.join(base.replace(".jsonl", ".zip"));
+        make_zip(&zip_path, base, jsonl.as_bytes(), &img_tmp)?;
+        let bytes = fs::read(&zip_path).map_err(|e| e.to_string())?;
+        let _ = fs::remove_dir_all(&tmp);
+        bytes
+    } else {
+        jsonl.as_bytes().to_vec()
+    };
+
+    write_uri(app, uri, &payload)?;
+
+    Ok(ExportResult {
+        path: uri.to_string(),
+        zip_path: None,
+        tokenizer_path: None,
+        count: selected.len(),
+        skipped,
+        has_images,
+    })
+}
+
 #[tauri::command]
 pub fn export_data(
     app: AppHandle,
@@ -156,31 +238,37 @@ pub fn export_data(
         format!("{}_{}.jsonl", prefix, stamp)
     });
 
+    // 是否包含图片
+    let has_images = selected.iter().any(|r| r.has_image());
+
+    // 手机端「另存为」给的是 content:// URI，走单文件写入
+    if let Some(uri) = target_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| d.starts_with("content://"))
+    {
+        return export_to_uri(
+            &app,
+            &selected,
+            &jsonl,
+            &base,
+            uri,
+            has_images,
+            has_images && format != "pretrain",
+            skipped,
+        );
+    }
+
     let out_dir: PathBuf = match target_dir {
         Some(d) if !d.trim().is_empty() => PathBuf::from(d.trim()),
         _ => store::export_dir(&app)?,
     };
     fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
 
-    // 是否包含图片
-    let has_images = selected.iter().any(|r| r.has_image());
-
     // 有图时把用到的图片复制到 images/ 子目录
     let img_out = out_dir.join("images");
     if has_images {
-        fs::create_dir_all(&img_out).map_err(|e| e.to_string())?;
-        let src_dir = store::image_dir(&app)?;
-        for r in &selected {
-            for t in &r.turns {
-                for name in &t.images {
-                    let s = src_dir.join(name);
-                    let d = img_out.join(name);
-                    if s.exists() && !d.exists() {
-                        fs::copy(&s, &d).map_err(|e| e.to_string())?;
-                    }
-                }
-            }
-        }
+        copy_used_images(&app, &selected, &img_out)?;
     }
 
     let jsonl_path = out_dir.join(&base);
@@ -321,6 +409,10 @@ mod tests {
 /// 把全部数据镜像成固定的两个文件，方便训练脚本永远读同一个路径
 #[tauri::command]
 pub fn mirror(app: AppHandle) -> Result<Vec<String>, String> {
+    // 桌面端保持数据目录不变；Android 上数据目录在内部存储看不到，改放导出目录
+    #[cfg(target_os = "android")]
+    let dir = store::export_dir(&app)?;
+    #[cfg(not(target_os = "android"))]
     let dir = store::data_dir(&app)?;
     let mut written = Vec::new();
 

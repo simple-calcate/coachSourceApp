@@ -15,8 +15,19 @@ pub fn image_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(data_dir(app)?.join("images"))
 }
 
+/// 导出目录。Android 上放应用外部存储的 Download 目录
+/// （/storage/emulated/0/Android/data/<包名>/files/Download），
+/// 不需要任何存储权限，自带文件管理器就能看到；
+/// 内部 /data/user/0 目录手机用户根本没法浏览。桌面端行为不变。
 pub fn export_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(data_dir(app)?.join("export"))
+    #[cfg(target_os = "android")]
+    {
+        app.path().download_dir().map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Ok(data_dir(app)?.join("export"))
+    }
 }
 
 fn db_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -27,7 +38,10 @@ fn db_path(app: &AppHandle) -> Result<PathBuf, String> {
 pub fn init_dirs(app: &AppHandle) -> Result<(), String> {
     let d = data_dir(app)?;
     fs::create_dir_all(d.join("images")).map_err(|e| e.to_string())?;
-    fs::create_dir_all(d.join("export")).map_err(|e| e.to_string())?;
+    // 导出目录在 Android 上是外部存储，解析失败不拦启动（导出时会再试一次）
+    if let Ok(dir) = export_dir(app) {
+        let _ = fs::create_dir_all(dir);
+    }
     Ok(())
 }
 
